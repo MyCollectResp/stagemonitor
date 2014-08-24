@@ -7,9 +7,9 @@ import org.stagemonitor.core.MeasurementSession;
 import org.stagemonitor.core.StageMonitor;
 import org.stagemonitor.core.util.IOUtils;
 import org.stagemonitor.requestmonitor.RequestMonitor;
+import org.stagemonitor.web.configuration.ConfigurationServlet;
 import org.stagemonitor.web.monitor.HttpRequestTrace;
 import org.stagemonitor.web.monitor.MonitoredHttpRequest;
-import org.stagemonitor.web.monitor.QueryParameterConfigurationSource;
 
 import javax.servlet.Filter;
 import javax.servlet.FilterChain;
@@ -22,15 +22,14 @@ import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.Map;
 
 public class HttpRequestMonitorFilter extends AbstractExclusionFilter implements Filter {
 
 	private static final Logger logger = LoggerFactory.getLogger(HttpRequestMonitorFilter.class);
 	protected final Configuration configuration;
 	protected final RequestMonitor requestMonitor;
-	private final QueryParameterConfigurationSource queryParameterConfigurationSource;
 	private boolean servletApiForWidgetSufficient = true;
+	private String widgetTemplate;
 
 	public HttpRequestMonitorFilter() {
 		this(StageMonitor.getConfiguration());
@@ -38,7 +37,6 @@ public class HttpRequestMonitorFilter extends AbstractExclusionFilter implements
 
 	public HttpRequestMonitorFilter(Configuration configuration) {
 		this.configuration = configuration;
-		queryParameterConfigurationSource = new QueryParameterConfigurationSource(configuration);
 		requestMonitor = new RequestMonitor(configuration);
 	}
 
@@ -47,17 +45,25 @@ public class HttpRequestMonitorFilter extends AbstractExclusionFilter implements
 		final MeasurementSession measurementSession = new MeasurementSession(getApplicationName(filterConfig),
 				RequestMonitor.getHostName(), configuration.getInstanceName());
 		requestMonitor.setMeasurementSession(measurementSession);
-		configuration.addConfigurationSource(queryParameterConfigurationSource, true);
 
 		if (configuration.isStagemonitorWidgetEnabled()) {
 			final ServletContext servletContext = filterConfig.getServletContext();
 			if(servletContext.getMajorVersion() >= 3) {
 				servletApiForWidgetSufficient = true;
+				filterConfig.getServletContext()
+						.addServlet("stagemonitor-config-servlet", new ConfigurationServlet(configuration))
+						.addMapping("/stagemonitor/configuration");
 			} else {
 				servletApiForWidgetSufficient = false;
 				logger.error("stagemonitor.web.widget.enabled is true, but your servlet api version is not supported. " +
 						"The stagemonitor widget requires servlet api 3.");
 			}
+		}
+
+		try {
+			this.widgetTemplate = buildWidgetTemplate(filterConfig.getServletContext().getContextPath());
+		} catch (IOException e) {
+			logger.warn(e.getMessage(), e);
 		}
 	}
 
@@ -75,8 +81,6 @@ public class HttpRequestMonitorFilter extends AbstractExclusionFilter implements
 		beforeFilter();
 		if (configuration.isStagemonitorActive() && request instanceof HttpServletRequest && response instanceof HttpServletResponse && ! isInternalRequest((HttpServletRequest) request)) {
 			final HttpServletRequest httpServletRequest = (HttpServletRequest) request;
-
-			updateConfiguration(httpServletRequest);
 
 			final StatusExposingByteCountingServletResponse responseWrapper;
 			HttpServletResponseBufferWrapper httpServletResponseBufferWrapper = null;
@@ -124,33 +128,13 @@ public class HttpRequestMonitorFilter extends AbstractExclusionFilter implements
 				&& httpServletResponseBufferWrapper.getContentType().contains("text/html")
 				&& httpServletRequest.getAttribute("stagemonitorWidgetInjected") == null) {
 			httpServletRequest.setAttribute("stagemonitorWidgetInjected", true);
-			content = injectBeforeClosingBody(httpServletResponseBufferWrapper.getBufferedContent(), buildWidget(requestInformation, httpServletRequest));
+			final String widget = widgetTemplate.replace("@@JSON_REQUEST_TACE_PLACEHOLDER@@", requestInformation.getRequestTrace().toJson());
+			content = injectBeforeClosingBody(httpServletResponseBufferWrapper.getBufferedContent(), widget);
 		} else {
 			// passthrough
 			content = httpServletResponseBufferWrapper.getBufferedContent();
 		}
 		IOUtils.write(content, response.getOutputStream());
-	}
-
-	private void updateConfiguration(HttpServletRequest httpServletRequest) {
-		@SuppressWarnings("unchecked")
-		final Map<String, String[]> parameterMap = httpServletRequest.getParameterMap();
-
-		final String configurationUpdatePassword = getFirstOrEmpty(parameterMap.get("stagemonitor.configuration.update.password"));
-		for (Map.Entry<String, String[]> entry : parameterMap.entrySet()) {
-			if ("stagemonitorReloadConfig".equals(entry.getKey())) {
-				configuration.reload();
-			} else if (entry.getKey().startsWith("stagemonitor.")) {
-				queryParameterConfigurationSource.updateConfiguration(entry.getKey(), getFirstOrEmpty(entry.getValue()), configurationUpdatePassword);
-			}
-		}
-	}
-
-	private String getFirstOrEmpty(String[] strings) {
-		if (strings != null && strings.length > 0) {
-			return strings[0];
-		}
-		return "";
 	}
 
 	private String injectBeforeClosingBody(String unmodifiedContent, String contentToInject) {
@@ -169,11 +153,9 @@ public class HttpRequestMonitorFilter extends AbstractExclusionFilter implements
 		return modifiedContent;
 	}
 
-	private String buildWidget(RequestMonitor.RequestInformation<HttpRequestTrace> requestInformation, HttpServletRequest httpServletRequest) throws IOException {
+	private String buildWidgetTemplate(String contextPath) throws IOException {
 		final InputStream widgetStream = getClass().getClassLoader().getResourceAsStream("stagemonitorWidget.html");
-		return IOUtils.toString(widgetStream)
-				.replace("@@JSON_REQUEST_TACE_PLACEHOLDER@@", requestInformation.getRequestTrace().toJson())
-				.replace("@@CONTEXT_PREFIX_PATH@@", httpServletRequest.getContextPath());
+		return IOUtils.toString(widgetStream).replace("@@CONTEXT_PREFIX_PATH@@", contextPath);
 	}
 
 	protected void handleException(Exception e) throws IOException, ServletException  {
